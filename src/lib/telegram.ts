@@ -1,71 +1,72 @@
-// We use "any" for the client/types to avoid importing the library at the top level
-// which breaks Next.js build due to Node.js dependency requirements of gram.js
-// that are not polyfilled by default in the edge/server runtime.
+// Telegram authentication and client management.
+// Dynamic imports ensure gram.js only loads client-side.
 
 export class TelegramAuth {
     private client: any | null = null;
-    private apiId: number;
-    private apiHash: string;
+    private _apiId: number;
+    private _apiHash: string;
     private session: string;
 
     constructor(apiId: number, apiHash: string, session: string = '') {
-        this.apiId = apiId;
-        this.apiHash = apiHash;
+        this._apiId = apiId;
+        this._apiHash = apiHash;
         this.session = session;
     }
 
-    async init() {
+    /** Public getter for API ID — eliminates @ts-ignore casts */
+    get apiId(): number {
+        return this._apiId;
+    }
+
+    /** Public getter for API Hash — eliminates @ts-ignore casts */
+    get apiHash(): string {
+        return this._apiHash;
+    }
+
+    async init(dcId?: number): Promise<any> {
         if (this.client) return this.client;
 
-        // Dynamic import to ensure this only runs client-side/runtime
         const { TelegramClient } = await import('telegram');
         const { StringSession } = await import('telegram/sessions');
 
         const stringSession = new StringSession(this.session);
-        this.client = new TelegramClient(stringSession, this.apiId, this.apiHash, {
+        this.client = new TelegramClient(stringSession, this._apiId, this._apiHash, {
             connectionRetries: 5,
+            useWSS: true, // Use Secure WebSockets
+            dcId: dcId,  // DIRECT DC CONNECTION
         });
 
         await this.client.connect();
         return this.client;
     }
 
-    async sendCode(phoneNumber: string) {
+    async sendCode(phoneNumber: string): Promise<any> {
         if (!this.client) await this.init();
 
-        const id = Number(this.apiId);
+        const id = Number(this._apiId);
         if (isNaN(id)) {
-            throw new Error("API ID must be a number");
+            throw new Error('API ID must be a number');
         }
 
-        console.log("Sending code via invoke:", {
-            apiId: id,
-            apiHash: this.apiHash,
-            phoneNumber: phoneNumber
-        });
-
-        // Dynamic import for runtime
         const { Api } = await import('telegram');
 
-        // Using low-level invoke to avoid helper issues
-        // Api.auth.SendCode params: phone_number, api_id, api_hash, settings
         return this.client?.invoke(
             new Api.auth.SendCode({
                 phoneNumber: String(phoneNumber),
                 apiId: id,
-                apiHash: String(this.apiHash),
+                apiHash: String(this._apiHash),
                 settings: new Api.CodeSettings({
                     allowFlashcall: false,
                     currentNumber: false,
                     allowAppHash: false,
                     allowMissedCall: false,
-                    logoutTokens: []
+                    logoutTokens: [],
                 }),
             })
         );
     }
 
-    async signIn(phoneNumber: string, phoneCodeHash: string, phoneCode: string) {
+    async signIn(phoneNumber: string, phoneCodeHash: string, phoneCode: string): Promise<any> {
         if (!this.client) await this.init();
 
         const { Api } = await import('telegram');
@@ -74,39 +75,35 @@ export class TelegramAuth {
             new Api.auth.SignIn({
                 phoneNumber,
                 phoneCodeHash,
-                phoneCode
+                phoneCode,
             })
         );
     }
 
-    async signInWithPassword(password: string) {
+    async signInWithPassword(password: string): Promise<any> {
         if (!this.client) await this.init();
 
         const { Api } = await import('telegram');
         const passwordModule = await import('telegram/Password');
 
-        // 1. Get the current password info (SRP parameters)
         const passwordInfo = await this.client.invoke(
             new Api.account.GetPassword()
         );
 
-        // 2. Compute the SRP hash using the password module's computeCheck function
         const passwordSrp = await passwordModule.computeCheck(passwordInfo, password);
 
-        // 3. Send the check password request with the computed SRP
         return this.client.invoke(
             new Api.auth.CheckPassword({
-                password: passwordSrp
+                password: passwordSrp,
             })
         );
     }
 
-    getClient() {
+    getClient(): any | null {
         return this.client;
     }
 
-    getSession() {
-        // @ts-ignore
+    getSession(): string {
         return this.client?.session.save() as unknown as string;
     }
 }

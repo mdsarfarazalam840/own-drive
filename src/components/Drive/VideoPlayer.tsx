@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { TelegramAuth } from '@/lib/telegram';
 import { X } from 'lucide-react';
+import { motion } from 'framer-motion';
 
 interface VideoPlayerProps {
     auth: TelegramAuth;
@@ -10,170 +11,152 @@ interface VideoPlayerProps {
     onClose: () => void;
 }
 
+/**
+ * Elite Video Player for Space Drive
+ * Uses Service Worker Streaming to provide a "YouTube-like" experience
+ * with native seeking, buffering, and broad format support.
+ */
 export default function VideoPlayer({ auth, file, onClose }: VideoPlayerProps) {
     const [loading, setLoading] = useState(true);
     const [progress, setProgress] = useState(0);
     const [error, setError] = useState<string | null>(null);
     const videoRef = useRef<HTMLVideoElement>(null);
-    const mediaSourceRef = useRef<MediaSource | null>(null);
-    const sourceBufferRef = useRef<SourceBuffer | null>(null);
 
     useEffect(() => {
         let active = true;
-        // Use a balanced chunk size
-        const CHUNK_SIZE = 1024 * 1024; // 1MB chunks for smoother initial playback
+        const STREAM_PATH = '/api/stream-video/';
 
-        const initPlayer = async () => {
-            if (!videoRef.current) return;
-
-            const mimeType = file.document?.mimeType || 'video/mp4; codecs="avc1.42E01E, mp4a.40.2"';
-
-            if (!MediaSource.isTypeSupported(mimeType)) {
-                console.warn("MIME type not supported for streaming, falling back to full download");
-                downloadAndPlay();
+        const setupStreaming = async () => {
+            if (!('serviceWorker' in navigator)) {
+                setError('Service Workers not supported. Please use a modern browser.');
                 return;
             }
 
-            const mediaSource = new MediaSource();
-            videoRef.current.src = URL.createObjectURL(mediaSource);
-            mediaSourceRef.current = mediaSource;
+            try {
+                // 1. Pre-warm the Telegram Connection to the correct DC
+                const client = await auth.init(file.document?.dcId);
+                if (!active) return;
 
-            mediaSource.addEventListener('sourceopen', async () => {
-                try {
-                    const sourceBuffer = mediaSource.addSourceBuffer(mimeType);
-                    sourceBufferRef.current = sourceBuffer;
+                // 2. Register and Wait for the Streaming Service Worker
+                await navigator.serviceWorker.register('/sw-stream.js');
+                await navigator.serviceWorker.ready;
 
-                    const client = await auth.init();
-                    if (!client) return;
+                // 3. Setup Message Handler for Range Requests
+                const handleMessage = async (event: MessageEvent) => {
+                    if (!active) return;
+                    const { type, fileId, start, end } = event.data;
 
-                    const fileSize = Number(file.document?.size || 0);
-                    let processedBytes = 0;
-
-                    // Sequential Streaming using a single iterator
-                    // This is more stable than parallel fetching for MSE
-                    const streamVideo = async () => {
+                    if (type === 'GET_RANGE') {
                         try {
-                            const chunkIterator = client.iterDownload(file, {
-                                requestSize: CHUNK_SIZE,
+                            const fileSize = Number(file.document?.size || 0);
+                            
+                            // Browser asks for specific bytes, proxy the request to Telegram
+                            const requestedLimit = end ? (end - start + 1) : (1024 * 1024 * 4); // 4MB default
+                            const limit = Math.min(requestedLimit, fileSize - start);
+
+                            const chunk = await client.downloadMedia(file, {
+                                offset: BigInt(start),
+                                limit: limit,
+                                workers: 16, // EXTREME PARALLELISM
+                                dcId: file.document?.dcId,
+                                progressCallback: (total: bigint | number) => {
+                                    if (!active) return;
+                                    const percent = Math.round((Number(total) / limit) * 100);
+                                    setProgress(Math.min(percent, 99));
+                                }
                             });
 
-                            for await (const chunk of chunkIterator) {
-                                if (!active) break;
-
-                                // Buffer management: Wait if too much buffered
-                                if (sourceBuffer.buffered.length > 0) {
-                                    const bufferedEnd = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-                                    if (videoRef.current && bufferedEnd - videoRef.current.currentTime > 30) {
-                                        // Simple wait loop
-                                        while (videoRef.current && (sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1) - videoRef.current.currentTime > 30) && active) {
-                                            await new Promise(r => setTimeout(r, 500));
-                                        }
-                                    }
-                                }
-
-                                // Wait for previous update
-                                while (sourceBuffer.updating && active) {
-                                    await new Promise(r => setTimeout(r, 50));
-                                }
-                                if (!active) break;
-
-                                // Append
-                                try {
-                                    sourceBuffer.appendBuffer(chunk);
-                                    // Wait for this append to finish
-                                    while (sourceBuffer.updating && active) {
-                                        await new Promise(r => setTimeout(r, 10));
-                                    }
-
-                                    processedBytes += chunk.length;
-                                    setProgress(Math.round((processedBytes / fileSize) * 100));
-
-                                    if (loading && processedBytes > 0) setLoading(false);
-
-                                } catch (appendError) {
-                                    console.error("Append error", appendError);
-                                    // If quota exceeded, we might need to remove old buffer, 
-                                    // but for now let's just break or try to continue
-                                    break;
-                                }
+                            if (event.ports[0] && active) {
+                                setProgress(100);
+                                event.ports[0].postMessage({
+                                    type: 'STREAM_DATA',
+                                    data: chunk,
+                                    totalSize: fileSize,
+                                    mimeType: file.document?.mimeType || 'video/mp4'
+                                });
                             }
-
-                            if (active && mediaSource.readyState === 'open' && !sourceBuffer.updating) {
-                                mediaSource.endOfStream();
-                            }
-
-                        } catch (streamErr) {
-                            console.error("Streaming error:", streamErr);
+                        } catch (err) {
+                            console.error('Stream chunk fetch failed:', err);
                         }
+                    }
+                };
+
+                navigator.serviceWorker.addEventListener('message', handleMessage);
+
+                // 3. Set the video source to the Service Worker proxy URL
+                if (videoRef.current) {
+                    const uniqueId = file.id || Date.now();
+                    videoRef.current.src = `${STREAM_PATH}${uniqueId}`;
+                    
+                    // Native event: hide loading when first frame is ready
+                    videoRef.current.onloadeddata = () => {
+                        if (active) setLoading(false);
                     };
 
-                    streamVideo();
-
-                } catch (e: any) {
-                    console.error("MSE Error:", e);
-                    setError("Playback error: " + e.message);
+                    videoRef.current.onerror = () => {
+                        if (active) setError('Browser codec error: This format might not be supported natively.');
+                    };
                 }
-            });
-        };
 
-        const downloadAndPlay = async () => {
-            try {
-                const client = await auth.init();
-                const buffer = await client.downloadMedia(file, {
-                    progressCallback: (transferred: any, total: any) => {
-                        if (active) {
-                            const percent = Math.round((Number(transferred) / Number(total)) * 100);
-                            setProgress(percent);
-                        }
-                    }
-                });
-                if (active && buffer) {
-                    const blob = new Blob([buffer], { type: file.document?.mimeType || 'video/mp4' });
-                    if (videoRef.current) {
-                        videoRef.current.src = URL.createObjectURL(blob);
-                        setLoading(false);
-                    }
-                }
-            } catch (e: any) {
-                setError(e.message);
+                return () => {
+                    navigator.serviceWorker.removeEventListener('message', handleMessage);
+                };
+            } catch (err) {
+                console.error('Elite Streaming Init Error:', err);
+                setError('Streaming initialization failed. Please refresh the page.');
             }
         };
 
-        initPlayer();
+        setupStreaming();
 
         return () => {
             active = false;
-            // Clean up
-            if (videoRef.current?.src) {
-                URL.revokeObjectURL(videoRef.current.src);
-            }
         };
     }, [auth, file]);
 
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/95 backdrop-blur-md">
-            <div className="relative w-full max-w-6xl aspect-video bg-black rounded-sm overflow-hidden shadow-2xl">
+        <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/95 backdrop-blur-md"
+        >
+            <div className="relative w-full max-w-6xl aspect-video bg-black rounded-xl overflow-hidden shadow-2xl border border-white/[0.06]"
+                 style={{ boxShadow: '0 0 60px rgba(124,58,237,0.1)' }}>
+                
+                {/* Header / Close */}
                 <button
                     onClick={onClose}
-                    className="absolute top-4 right-4 z-20 p-2 bg-black/50 hover:bg-white/20 rounded-full text-white transition-all transform hover:scale-110"
+                    className="absolute top-4 right-4 z-20 p-2.5 bg-black/60 hover:bg-white/[0.12] rounded-full text-white transition-all hover:rotate-90 border border-white/[0.08]"
+                    aria-label="Close video player"
                 >
-                    <X className="w-6 h-6" />
+                    <X className="w-5 h-5" />
                 </button>
 
-                {loading && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center text-white z-10 bg-black/50">
-                        <div className="w-12 h-12 border-4 border-purple-500 border-t-transparent rounded-full animate-spin mb-4"></div>
-                        <p className="text-sm font-medium">Buffering {progress}%...</p>
+                {/* Loading Overlay */}
+                {loading && !error && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center text-white z-10 bg-black/60">
+                        <div className="w-14 h-14 border-3 border-[var(--neon-violet)] border-t-transparent rounded-full animate-spin mb-4" />
+                        <p className="text-sm font-medium font-mono text-[var(--neon-violet)] animate-pulse">
+                            Establishing Neural Stream... {progress}%
+                        </p>
                     </div>
                 )}
 
+                {/* Error Display */}
                 {error && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center text-red-400 z-10 bg-black/80 p-6 text-center">
-                        <p className="text-xl mb-4">{error}</p>
-                        <button onClick={onClose} className="px-4 py-2 bg-white/10 rounded">Close</button>
+                    <div className="absolute inset-0 flex flex-col items-center justify-center text-[var(--neon-rose)] z-10 bg-black/90 p-6 text-center">
+                        <p className="text-lg mb-4 font-medium">{error}</p>
+                        <button
+                            onClick={onClose}
+                            className="glass-button px-8 py-2.5"
+                        >
+                            Return to Command
+                        </button>
                     </div>
                 )}
 
+                {/* Native Video Element - SW handles the rest */}
                 <video
                     ref={videoRef}
                     controls
@@ -181,6 +164,6 @@ export default function VideoPlayer({ auth, file, onClose }: VideoPlayerProps) {
                     className="w-full h-full"
                 />
             </div>
-        </div>
+        </motion.div>
     );
 }

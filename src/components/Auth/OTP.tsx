@@ -1,8 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef, useCallback } from 'react';
 import { motion } from 'framer-motion';
-import { ArrowRight, Lock, ArrowLeft, MessageCircle } from 'lucide-react';
+import { ArrowRight, ArrowLeft, MessageCircle } from 'lucide-react';
 
 interface OTPProps {
     phoneNumber: string;
@@ -11,95 +11,149 @@ interface OTPProps {
     onBack: () => void;
 }
 
+const CODE_LENGTH = 5;
+
 export default function OTP({ phoneNumber, onVerify, isLoading, onBack }: OTPProps) {
-    const [code, setCode] = useState('');
+    const [digits, setDigits] = useState<string[]>(Array(CODE_LENGTH).fill(''));
+    const inputsRef = useRef<(HTMLInputElement | null)[]>([]);
+
+    const handleChange = useCallback((index: number, value: string) => {
+        // Only accept single digits
+        const digit = value.replace(/\D/g, '').slice(-1);
+
+        setDigits((prev) => {
+            const next = [...prev];
+            next[index] = digit;
+            return next;
+        });
+
+        // Auto-advance to next input
+        if (digit && index < CODE_LENGTH - 1) {
+            inputsRef.current[index + 1]?.focus();
+        }
+    }, []);
+
+    const handleKeyDown = useCallback((index: number, e: React.KeyboardEvent) => {
+        if (e.key === 'Backspace' && !digits[index] && index > 0) {
+            inputsRef.current[index - 1]?.focus();
+        }
+    }, [digits]);
+
+    const handlePaste = useCallback((e: React.ClipboardEvent) => {
+        e.preventDefault();
+        const pastedData = e.clipboardData.getData('text').replace(/\D/g, '').slice(0, CODE_LENGTH);
+        if (!pastedData) return;
+
+        const newDigits = Array(CODE_LENGTH).fill('');
+        pastedData.split('').forEach((char, i) => {
+            newDigits[i] = char;
+        });
+        setDigits(newDigits);
+
+        // Focus the next empty or last box
+        const focusIndex = Math.min(pastedData.length, CODE_LENGTH - 1);
+        inputsRef.current[focusIndex]?.focus();
+    }, []);
 
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
-        onVerify(code);
+        const code = digits.join('');
+        if (code.length === CODE_LENGTH) {
+            onVerify(code);
+        }
     };
+
+    const isComplete = digits.every((d) => d !== '');
 
     return (
         <motion.div
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ duration: 0.5 }}
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: -10 }}
+            transition={{ duration: 0.45, ease: [0.25, 0.8, 0.25, 1] }}
             className="w-full max-w-md"
         >
-            <div className="glass-panel p-10 relative overflow-hidden">
-                {/* Background decorations */}
-                <div className="absolute top-0 right-0 w-40 h-40 bg-purple-500/10 rounded-full blur-3xl pointer-events-none -mr-20 -mt-20" />
-                <div className="absolute bottom-0 left-0 w-40 h-40 bg-blue-500/10 rounded-full blur-3xl pointer-events-none -ml-20 -mb-20" />
+            <div className="glass-panel glass-panel-holo p-8 sm:p-10 relative overflow-hidden">
+                {/* Decorative glows */}
+                <div className="absolute top-0 right-0 w-32 h-32 bg-purple-500/8 rounded-full blur-3xl pointer-events-none -mr-16 -mt-16" />
+                <div className="absolute bottom-0 left-0 w-32 h-32 bg-cyan-500/8 rounded-full blur-3xl pointer-events-none -ml-16 -mb-16" />
 
                 <div className="relative z-10">
-                    {/* Header with Icon */}
+                    {/* Header */}
                     <div className="text-center mb-8">
-                        <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center">
-                            <MessageCircle className="w-8 h-8 text-white" />
+                        <div className="orbital-ring mx-auto mb-5 w-fit">
+                            <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-purple-500 to-cyan-500 flex items-center justify-center">
+                                <MessageCircle className="w-8 h-8 text-white" />
+                            </div>
                         </div>
-                        <h1 className="text-3xl font-bold mb-2 text-white">Verification Code</h1>
-                        <p className="text-gray-400">
+                        <h1 className="text-2xl font-bold mb-2">Verification Code</h1>
+                        <p className="text-sm text-[var(--text-secondary)]">
                             Check your Telegram app for the code sent to
                         </p>
-                        <p className="text-purple-400 font-medium mt-1">{phoneNumber}</p>
+                        <p className="neon-text-violet font-semibold font-mono text-sm mt-1.5">{phoneNumber}</p>
                     </div>
 
-                    {/* Form */}
+                    {/* OTP Digit Boxes */}
                     <form onSubmit={handleSubmit} className="space-y-6">
-                        {/* Code Input */}
-                        <div className="space-y-2">
-                            <label className="text-sm font-medium text-gray-300 ml-1">
-                                Telegram Code
-                            </label>
-                            <div className="relative group">
-                                <Lock className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400 w-5 h-5 group-focus-within:text-purple-400 transition-colors" />
-                                <input
-                                    type="text"
-                                    placeholder="12345"
-                                    value={code}
-                                    onChange={(e) => setCode(e.target.value)}
-                                    className="glass-input pl-12 text-center text-3xl tracking-[0.5em] font-mono focus:ring-2 focus:ring-purple-500/50 focus:border-purple-500/50 transition-all"
-                                    maxLength={5}
-                                    required
-                                    autoFocus
-                                />
+                        <div>
+                            <label className="text-label ml-1 block mb-3">Enter Code</label>
+                            <div className="flex gap-3 justify-center" onPaste={handlePaste}>
+                                {digits.map((digit, i) => (
+                                    <input
+                                        key={i}
+                                        ref={(el) => { inputsRef.current[i] = el; }}
+                                        type="text"
+                                        inputMode="numeric"
+                                        maxLength={1}
+                                        value={digit}
+                                        onChange={(e) => handleChange(i, e.target.value)}
+                                        onKeyDown={(e) => handleKeyDown(i, e)}
+                                        className={`
+                                            w-14 h-16 text-center text-2xl font-bold font-mono
+                                            glass-input rounded-xl transition-all
+                                            ${digit ? 'border-[var(--neon-violet)] bg-[var(--neon-violet)]/[0.06]' : ''}
+                                        `}
+                                        aria-label={`Digit ${i + 1} of ${CODE_LENGTH}`}
+                                        autoFocus={i === 0}
+                                    />
+                                ))}
                             </div>
-                            <p className="text-xs text-gray-500 text-center mt-2">
-                                Enter the 5-digit code from your Telegram app
+                            <p className="text-xs text-[var(--text-muted)] text-center mt-3 font-mono">
+                                {CODE_LENGTH}-digit code from Telegram
                             </p>
                         </div>
 
-                        {/* Submit Button */}
+                        {/* Submit */}
                         <button
                             type="submit"
-                            disabled={isLoading || code.length !== 5}
-                            className="w-full glass-button justify-center gap-2 group relative overflow-hidden bg-gradient-to-r from-purple-500/20 to-blue-500/20 hover:from-purple-500/30 hover:to-blue-500/30 disabled:opacity-50 disabled:cursor-not-allowed py-4"
+                            disabled={isLoading || !isComplete}
+                            className="w-full glass-button glass-button-primary justify-center py-4 group"
+                            id="otp-submit"
                         >
                             <span className="relative font-semibold tracking-wide">
-                                {isLoading ? 'Verifying Code...' : 'Access My Space'}
+                                {isLoading ? 'Verifying...' : 'Access My Space'}
                             </span>
-                            {!isLoading && (
+                            {!isLoading ? (
                                 <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform relative" />
-                            )}
-                            {isLoading && (
-                                <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
+                            ) : (
+                                <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                             )}
                         </button>
 
-                        {/* Back Button */}
+                        {/* Back */}
                         <button
                             type="button"
                             onClick={onBack}
-                            className="w-full flex items-center justify-center gap-2 text-sm text-gray-400 hover:text-white transition-colors py-3 hover:bg-white/5 rounded-lg"
+                            className="w-full flex items-center justify-center gap-2 text-sm text-[var(--text-secondary)] hover:text-white transition-colors py-3 hover:bg-white/[0.03] rounded-xl"
+                            id="otp-back"
                         >
                             <ArrowLeft className="w-4 h-4" />
                             Change Phone Number
                         </button>
                     </form>
 
-                    {/* Help Text */}
-                    <div className="mt-8 pt-6 border-t border-white/10">
-                        <p className="text-center text-xs text-gray-500">
+                    <div className="mt-8 pt-6 border-t border-white/[0.06]">
+                        <p className="text-center text-xs text-[var(--text-muted)]">
                             Didn't receive a code? Check your Telegram app or try again
                         </p>
                     </div>
