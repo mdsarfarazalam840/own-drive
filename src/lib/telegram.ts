@@ -30,11 +30,16 @@ export class TelegramAuth {
         const { StringSession } = await import('telegram/sessions');
 
         const stringSession = new StringSession(this.session);
-        this.client = new TelegramClient(stringSession, this._apiId, this._apiHash, {
+        const clientConfig: Record<string, unknown> = {
             connectionRetries: 5,
             useWSS: true, // Use Secure WebSockets
-            dcId: dcId,  // DIRECT DC CONNECTION
-        });
+        };
+
+        if (dcId) {
+            clientConfig.dcId = dcId; // DIRECT DC CONNECTION
+        }
+
+        this.client = new TelegramClient(stringSession, this._apiId, this._apiHash, clientConfig as any);
 
         await this.client.connect();
         return this.client;

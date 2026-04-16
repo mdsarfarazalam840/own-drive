@@ -21,10 +21,41 @@ export default function VideoPlayer({ auth, file, onClose }: VideoPlayerProps) {
     const [progress, setProgress] = useState(0);
     const [error, setError] = useState<string | null>(null);
     const videoRef = useRef<HTMLVideoElement>(null);
+    const streamKey = String(file.id || Date.now());
+    const mimeType = file.document?.mimeType || 'video/mp4';
+    const fileSize = Number(file.document?.size || 0);
 
     useEffect(() => {
         let active = true;
         const STREAM_PATH = '/api/stream-video/';
+        let handleMessage: ((event: MessageEvent) => Promise<void>) | null = null;
+        let controllerChangeHandler: (() => void) | null = null;
+
+        const waitForServiceWorkerControl = async () => {
+            if (navigator.serviceWorker.controller) {
+                return true;
+            }
+
+            return new Promise<boolean>((resolve) => {
+                let settled = false;
+                const finish = (value: boolean) => {
+                    if (settled) return;
+                    settled = true;
+                    if (controllerChangeHandler) {
+                        navigator.serviceWorker.removeEventListener('controllerchange', controllerChangeHandler);
+                        controllerChangeHandler = null;
+                    }
+                    resolve(value);
+                };
+
+                controllerChangeHandler = () => finish(true);
+                navigator.serviceWorker.addEventListener('controllerchange', controllerChangeHandler, { once: true });
+
+                window.setTimeout(() => {
+                    finish(Boolean(navigator.serviceWorker.controller));
+                }, 4000);
+            });
+        };
 
         const setupStreaming = async () => {
             if (!('serviceWorker' in navigator)) {
@@ -33,31 +64,51 @@ export default function VideoPlayer({ auth, file, onClose }: VideoPlayerProps) {
             }
 
             try {
+                setLoading(true);
+                setProgress(0);
+                setError(null);
+
                 // 1. Pre-warm the Telegram Connection to the correct DC
                 const client = await auth.init(file.document?.dcId);
                 if (!active) return;
 
                 // 2. Register and Wait for the Streaming Service Worker
-                await navigator.serviceWorker.register('/sw-stream.js');
+                await navigator.serviceWorker.register('/sw-stream.js', { scope: '/' });
                 await navigator.serviceWorker.ready;
+                const hasController = await waitForServiceWorkerControl();
+                if (!active) return;
+
+                if (!hasController) {
+                    setLoading(false);
+                    setError('Streaming worker did not take control in time. Please refresh once and try again.');
+                    return;
+                }
 
                 // 3. Setup Message Handler for Range Requests
-                const handleMessage = async (event: MessageEvent) => {
+                handleMessage = async (event: MessageEvent) => {
                     if (!active) return;
                     const { type, fileId, start, end } = event.data;
 
-                    if (type === 'GET_RANGE') {
+                    if (type === 'GET_RANGE' && String(fileId) === streamKey) {
                         try {
-                            const fileSize = Number(file.document?.size || 0);
-                            
-                            // Browser asks for specific bytes, proxy the request to Telegram
-                            const requestedLimit = end ? (end - start + 1) : (1024 * 1024 * 4); // 4MB default
-                            const limit = Math.min(requestedLimit, fileSize - start);
+                            if (start >= fileSize) {
+                                event.ports[0]?.postMessage({
+                                    type: 'STREAM_ERROR',
+                                    error: 'Requested byte range is outside the file size.',
+                                    status: 416,
+                                });
+                                return;
+                            }
+
+                            // Browser asks for specific bytes, proxy only a modest chunk so playback starts quickly.
+                            const requestedLimit = end ? (end - start + 1) : (1024 * 1024);
+                            const safeLimit = Math.max(64 * 1024, requestedLimit);
+                            const limit = Math.min(safeLimit, fileSize - start);
 
                             const chunk = await client.downloadMedia(file, {
                                 offset: BigInt(start),
                                 limit: limit,
-                                workers: 16, // EXTREME PARALLELISM
+                                workers: 4,
                                 dcId: file.document?.dcId,
                                 progressCallback: (total: bigint | number) => {
                                     if (!active) return;
@@ -67,16 +118,23 @@ export default function VideoPlayer({ auth, file, onClose }: VideoPlayerProps) {
                             });
 
                             if (event.ports[0] && active) {
+                                const payload = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
                                 setProgress(100);
                                 event.ports[0].postMessage({
                                     type: 'STREAM_DATA',
-                                    data: chunk,
+                                    data: payload,
                                     totalSize: fileSize,
-                                    mimeType: file.document?.mimeType || 'video/mp4'
+                                    mimeType,
                                 });
                             }
                         } catch (err) {
                             console.error('Stream chunk fetch failed:', err);
+                            const message = err instanceof Error ? err.message : 'Failed to fetch stream chunk.';
+                            event.ports[0]?.postMessage({
+                                type: 'STREAM_ERROR',
+                                error: message,
+                                status: 504,
+                            });
                         }
                     }
                 };
@@ -85,22 +143,41 @@ export default function VideoPlayer({ auth, file, onClose }: VideoPlayerProps) {
 
                 // 3. Set the video source to the Service Worker proxy URL
                 if (videoRef.current) {
-                    const uniqueId = file.id || Date.now();
-                    videoRef.current.src = `${STREAM_PATH}${uniqueId}`;
+                    videoRef.current.preload = 'metadata';
+                    videoRef.current.playsInline = true;
+                    videoRef.current.src = `${STREAM_PATH}${streamKey}?mime=${encodeURIComponent(mimeType)}`;
+                    videoRef.current.load();
                     
                     // Native event: hide loading when first frame is ready
+                    videoRef.current.onloadedmetadata = () => {
+                        if (active) setLoading(false);
+                    };
+
                     videoRef.current.onloadeddata = () => {
                         if (active) setLoading(false);
                     };
 
+                    videoRef.current.oncanplay = () => {
+                        if (active) setLoading(false);
+                    };
+
                     videoRef.current.onerror = () => {
-                        if (active) setError('Browser codec error: This format might not be supported natively.');
+                        const mediaError = videoRef.current?.error;
+                        if (!active) return;
+
+                        if (mediaError?.code === MediaError.MEDIA_ERR_NETWORK) {
+                            setError('Video stream request failed before playback could start. Please try again.');
+                            return;
+                        }
+
+                        if (mediaError?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
+                            setError(`This browser could not play the returned ${mimeType} stream.`);
+                            return;
+                        }
+
+                        setError('Video playback failed. The stream may have timed out or the file format is unsupported.');
                     };
                 }
-
-                return () => {
-                    navigator.serviceWorker.removeEventListener('message', handleMessage);
-                };
             } catch (err) {
                 console.error('Elite Streaming Init Error:', err);
                 setError('Streaming initialization failed. Please refresh the page.');
@@ -111,8 +188,14 @@ export default function VideoPlayer({ auth, file, onClose }: VideoPlayerProps) {
 
         return () => {
             active = false;
+            if (handleMessage) {
+                navigator.serviceWorker.removeEventListener('message', handleMessage);
+            }
+            if (controllerChangeHandler) {
+                navigator.serviceWorker.removeEventListener('controllerchange', controllerChangeHandler);
+            }
         };
-    }, [auth, file]);
+    }, [auth, file, mimeType, streamKey, fileSize]);
 
     return (
         <motion.div
@@ -161,6 +244,7 @@ export default function VideoPlayer({ auth, file, onClose }: VideoPlayerProps) {
                     ref={videoRef}
                     controls
                     autoPlay
+                    playsInline
                     className="w-full h-full"
                 />
             </div>
